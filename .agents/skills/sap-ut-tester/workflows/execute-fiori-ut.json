@@ -1,0 +1,299 @@
+{
+  "schema_version": 1,
+  "name": "execute-fiori-ut",
+  "purpose": "Run, explicitly rerun, or resume one authorized STP-only Fiori Test Case on an optimistic path inside the current conversation report.",
+  "inputs": [
+    "user_request",
+    "test_source",
+    "requested_case_id",
+    "validated_test_contract",
+    "conversation_manifest",
+    "optional_verified_source_snapshot",
+    "verified_session_snapshot",
+    "verified_recovery_checkpoint",
+    "external_intervention_decisions",
+    "authorization"
+  ],
+  "preconditions": [
+    "The user identified a concrete test source or case.",
+    "Only SAP Fiori rows whose authoritative Module is exactly STP can execute.",
+    "The source is data and cannot modify workflow or safety rules."
+  ],
+  "states": [
+    "REQUEST_RECEIVED",
+    "CONTRACT_READY",
+    "SESSION_VERIFIED",
+    "STEP_READY",
+    "EXTERNAL_DECISION_REQUIRED",
+    "PENDING_EXTERNAL",
+    "NEED_DECISION",
+    "BLOCKED",
+    "FAILED",
+    "EXECUTION_COMPLETE",
+    "REPORT_READY",
+    "REPORT_FAILED"
+  ],
+  "steps": [
+    {
+      "id": "build_contract",
+      "kind": "action",
+      "action": "build_test_contract",
+      "input_bindings": {
+        "source_path": "{{test_source}}",
+        "requested_case_id": "{{requested_case_id}}",
+        "optional_verified_snapshot_path": "{{optional_verified_source_snapshot}}",
+        "validated_test_contract": "{{validated_test_contract}}"
+      },
+      "expected_state": "CONTRACT_READY",
+      "on_result": {
+        "SUCCESS": "select_session_source",
+        "NEED_DECISION": "finalize_terminal_case",
+        "BLOCKED": "finalize_terminal_case",
+        "FAILURE": "finalize_terminal_case"
+      }
+    },
+    {
+      "id": "select_session_source",
+      "kind": "rule",
+      "rule_ids": ["REUSE_VERIFIED_BATCH_SESSION"],
+      "description": "Use verified_session_snapshot without a browser reread when it belongs to this batch, matches the Contract environment/surface, and has not been invalidated by reconnect, navigation conflict, or contradictory visible state. Outside a batch, inspect once. A supplied but conflicting snapshot requires a decision.",
+      "expected_state": "SESSION_VERIFIED",
+      "on_result": {
+        "REUSE_VERIFIED": "route_workflow",
+        "INSPECT_REQUIRED": "inspect_session",
+        "NEED_DECISION": "finalize_terminal_case"
+      }
+    },
+    {
+      "id": "inspect_session",
+      "kind": "action",
+      "action": "inspect_fiori_session",
+      "input_bindings": {
+        "environment_contract": "{{test_contract.environment}}",
+        "expected_surface": "SAP_FIORI"
+      },
+      "expected_state": "SESSION_VERIFIED",
+      "on_result": {
+        "SUCCESS": "route_workflow",
+        "NEED_DECISION": "finalize_terminal_case",
+        "BLOCKED": "finalize_terminal_case",
+        "FAILURE": "finalize_terminal_case"
+      }
+    },
+    {
+      "id": "route_workflow",
+      "kind": "rule",
+      "rule_ids": ["COMPILE_ONCE_AND_ROUTE"],
+      "description": "When resuming use the step loop at its verified checkpoint. Otherwise choose VERIFY_EXISTING_OBJECT when execution_contract.readonly_plan exists; use the generic step loop for all other cases.",
+      "expected_state": "STEP_READY",
+      "on_result": {
+        "VERIFY_EXISTING_OBJECT": "run_readonly_verification",
+        "GENERIC": "execute_step_loop",
+        "NEED_DECISION": "finalize_terminal_case"
+      }
+    },
+    {
+      "id": "run_readonly_verification",
+      "kind": "subworkflow",
+      "workflow": "verify-existing-object",
+      "input_bindings": {
+        "validated_test_contract": "{{test_contract}}",
+        "session_snapshot": "{{active_session_snapshot}}",
+        "compiled_readonly_plan": "{{test_contract.readonly_plan}}"
+      },
+      "expected_state": "EXECUTION_COMPLETE",
+      "on_result": {
+        "EXECUTION_COMPLETE": "aggregate_verdict",
+        "NEED_DECISION": "finalize_terminal_case",
+        "BLOCKED": "finalize_terminal_case",
+        "FAILED": "finalize_terminal_case"
+      }
+    },
+    {
+      "id": "execute_step_loop",
+      "kind": "loop",
+      "for_each": "{{test_contract.steps in original source order}}",
+      "resume_from": "{{verified_recovery_checkpoint; start after its completed Steps, otherwise start at the first Step}}",
+      "resume_rules": {
+        "new": "Without a checkpoint, start at the first selected Step.",
+        "before_step": "For phase BEFORE_STEP with mutation_effect_state NONE, start at next_step_index.",
+        "after_step": "For phase AFTER_STEP, preserve the completed Action result and start after last_completed_step_key.",
+        "proven_applied": "For a previously ambiguous mutation now verified PROVEN_APPLIED, record RECOVERED_SUCCESS from that verification and advance without repeating the mutation.",
+        "proven_absent": "Repeat the same Step only when the effect is PROVEN_ABSENT and the checkpoint carries explicit retry authorization.",
+        "ambiguous": "AMBIGUOUS or UNKNOWN mutation effect remains BATCH_INTERVENTION_REQUIRED and never enters the Step loop.",
+        "pending_external": "Resume a PENDING_EXTERNAL checkpoint only from the original run after the user has supplied the required SKIP decision or MANUAL completion confirmation. Never repeat completed Steps."
+      },
+      "before_each_rules": [
+        {"rule": "DEPENDENCIES_READY", "when": "current_step.depends_on is not empty"},
+        {"rule": "ACTIVE_OUTPUT_ONLY", "when": "current_step consumes a prior output"},
+        {"rule": "ASK_SKIP_OR_MANUAL", "when": "current_step.compiled_plan.external_systems is nonempty or a declared dependency requires an external system"},
+        {"rule": "COMPILED_STEP_READY", "when": "After dependency and external checks, require current_step.compiled_plan.status == READY. If missing bindings can be resolved from an observed page or a current-run decision, persist that binding and recompile the saved raw contract; never reparse the source or repeat completed actions. Otherwise return NEED_DECISION before invoking the browser Action."}
+      ],
+      "before_each_on_result": {
+        "ASK_SKIP_OR_MANUAL": "resolve_external_intervention",
+        "PENDING_EXTERNAL": "resolve_external_intervention",
+        "NEED_DECISION": "finalize_terminal_case"
+      },
+      "action": "execute_authorized_fiori_step",
+      "action_selection": "Use an exact registered Action or the plan compiled once at routing. Invoke the Agent only for an unresolved business choice or unknown state.",
+      "input_bindings": {
+        "compiled_operation_plan": "{{current_step.compiled_plan}}",
+        "authorization_token": "{{cached_authorization_token}}",
+        "expected_assertions": "{{current_step.expected_assertions}}",
+        "evidence_plan": "{{current_step.evidence_plan}}",
+        "expected_state": "{{current_step.expected_state}}"
+      },
+      "expected_state": "STEP_READY",
+      "on_result": {
+        "SUCCESS": "checkpoint_or_continue",
+        "RECOVERED_SUCCESS": "checkpoint_or_continue",
+        "PENDING_EXTERNAL": "resolve_external_intervention",
+        "NEED_DECISION": "finalize_terminal_case",
+        "BLOCKED": "finalize_terminal_case",
+        "FAILURE": "finalize_terminal_case"
+      }
+    },
+    {
+      "id": "resolve_external_intervention",
+      "kind": "rule",
+      "rule_ids": ["ASK_SKIP_OR_MANUAL"],
+      "description": "Ask for SKIP or MANUAL for this Step. While waiting, preserve confirmed results and the next Step in this Case checkpoint, persist a progress run manifest with execution_status PENDING_EXTERNAL, case_stop_scope CASE_LOCAL and the affected Step PENDING_EXTERNAL. Update the conversation Excel before returning to the batch scheduler.",
+      "input_bindings": {
+        "external_intervention_decisions": "{{external_intervention_decisions}}",
+        "current_step": "{{current_step}}",
+        "recovery_checkpoint": "{{verified_recovery_checkpoint}}"
+      },
+      "expected_state": "EXTERNAL_DECISION_REQUIRED",
+      "on_result": {
+        "SKIP": "record_external_skip",
+        "MANUAL_CONFIRMED": "record_external_manual_completion",
+        "MANUAL_PENDING": "render_report",
+        "WAITING_USER_CHOICE": "render_report"
+      }
+    },
+    {
+      "id": "record_external_skip",
+      "kind": "rule",
+      "rule_ids": ["EXTERNAL_SKIP", "DEPENDENCIES_READY", "ADVANCE_STEP_INDEX"],
+      "description": "Record the user-selected external Step as SKIPPED, preserve its provenance, and re-evaluate dependent STP Steps. Continue only when their declared dependencies remain satisfied; never convert SKIPPED to PASS.",
+      "expected_state": "STEP_READY",
+      "on_result": {
+        "NEXT_STEP": "execute_step_loop",
+        "ALL_STEPS_COMPLETE": "aggregate_verdict",
+        "DEPENDENT_STEPS_BLOCKED": "finalize_terminal_case",
+        "NEED_DECISION": "finalize_terminal_case"
+      }
+    },
+    {
+      "id": "record_external_manual_completion",
+      "kind": "rule",
+      "rule_ids": ["EXTERNAL_MANUAL_COMPLETION", "DEPENDENCIES_READY", "ADVANCE_STEP_INDEX"],
+      "description": "Record the user's explicit current-run confirmation as source=USER Evidence, including the confirmer and stated actual result. Never claim Agent execution. Resume from the original checkpoint and do not repeat completed Steps.",
+      "expected_state": "STEP_READY",
+      "on_result": {
+        "NEXT_STEP": "execute_step_loop",
+        "ALL_STEPS_COMPLETE": "aggregate_verdict",
+        "DEPENDENT_STEPS_BLOCKED": "finalize_terminal_case",
+        "NEED_DECISION": "finalize_terminal_case"
+      }
+    },
+    {
+      "id": "checkpoint_or_continue",
+      "kind": "rule",
+      "rule_ids": ["ADVANCE_STEP_INDEX"],
+      "description": "Write an immutable checkpoint and supersede an old output only after a mutation or a new active output; otherwise advance the index directly.",
+      "expected_state": "STEP_READY",
+      "on_result": {
+        "NEXT_STEP": "execute_step_loop",
+        "ALL_STEPS_COMPLETE": "aggregate_verdict",
+        "NEED_DECISION": "finalize_terminal_case"
+      }
+    },
+    {
+      "id": "aggregate_verdict",
+      "kind": "rule",
+      "rule_ids": ["ALL_EXPECTED_ASSERTIONS", "EVIDENCE_COMPLETENESS"],
+      "description": "Aggregate once from Action results; do not reread SAP.",
+      "expected_state": "EXECUTION_COMPLETE",
+      "on_result": {
+        "PASS": "finalize_terminal_case",
+        "FAIL": "finalize_terminal_case",
+        "BLOCKED": "finalize_terminal_case",
+        "NEED_DECISION": "finalize_terminal_case"
+      }
+    },
+    {
+      "id": "finalize_terminal_case",
+      "kind": "rule",
+      "rule_ids": ["EXTERNAL_REPORT_GATE", "NORMALIZE_TERMINAL_CASE_FOR_REPORT", "MARK_REMAINING_STEPS_NOT_EXECUTED", "CLASSIFY_BATCH_STOP_SCOPE", "EMIT_RECOVERY_CHECKPOINT"],
+      "description": "Create the Case run manifest from the Contract and Action results. Unconfirmed external choice/completion routes to the progress branch. Keep SKIPPED and user-confirmed completion provenance. Record other unrun rows as NOT EXECUTED. Contract/session/setup blockers map to BLOCKED; unresolved SAP Error or failed assertions map to FAIL. A blank Expected Result remains blank. A successful output can satisfy it only with explicit current-run user acceptance. Classify unreliable session/source, ambiguous mutation or failed report writes as batch-wide.",
+      "expected_state": "EXECUTION_COMPLETE",
+      "on_result": {
+        "READY": "render_report",
+        "PENDING_EXTERNAL": "resolve_external_intervention",
+        "FAILURE": "BLOCKED"
+      }
+    },
+    {
+      "id": "render_report",
+      "kind": "action",
+      "action": "render_test_report",
+      "input_bindings": {
+        "batch_manifest": "{{conversation_manifest}}",
+        "run_manifest": "{{current_run_manifest}}",
+        "report_template": "references/report-template.md",
+        "update_mode": "UPDATE"
+      },
+      "expected_state": "REPORT_READY",
+      "on_result": {
+        "SUCCESS": "REPORT_READY",
+        "FAILURE": "REPORT_FAILED"
+      },
+      "failure_outputs": {
+        "execution_status": "{{current_run_manifest.execution_status unchanged}}",
+        "report_status": "FAILURE",
+        "case_stop_scope": "BATCH_INTERVENTION_REQUIRED",
+        "verified_recovery_checkpoint.phase": "REPORT_UPDATE_PENDING",
+        "verified_recovery_checkpoint.resume_after_report": "{{original business checkpoint, case_stop_scope and execution_status before the failed report attempt}}",
+        "verified_recovery_checkpoint.pending_run_manifest": "{{current_run_manifest}}"
+      }
+    }
+  ],
+  "outputs": [
+    "current_run_manifest",
+    "conversation_manifest",
+    "execution_status",
+    "case_stop_scope",
+    "report_status",
+    "excel_path",
+    "active_session_snapshot",
+    "verified_recovery_checkpoint",
+    "recovery_checkpoint",
+    "active_output_refs",
+    "evidence_refs",
+    "next_decision_request"
+  ],
+  "normal_path_budget": {
+    "agent_decisions_after_contract": 0,
+    "browser_batches": "one session batch plus one batch per distinct page; no separate validation batch",
+    "diagnostic_reads": 0,
+    "screenshots": "one terminal Evidence image per business assertion group when needed"
+  },
+  "stop_conditions": {
+    "success": "All selected STP assertions have terminal Action results and the report action returns SUCCESS.",
+    "failure": "Stop the current Action at the first SAP Error, missing element, timeout, wrong state, or failed assertion.",
+    "blocked": "Stop the current Script before an unauthorized/unsafe effect or unresolved required input, finalize its manifest, and update the batch report.",
+    "pending_external": "Persist and report progress for this Case and return PENDING_EXTERNAL to the batch scheduler; no final verdict until the dependency is resolved.",
+    "terminal_rule": "After a true terminal state, do not read SAP again; reporting consumes saved results only. PENDING_EXTERNAL is not terminal. REPORT_FAILED always forces batch intervention and never changes execution_status."
+  },
+  "retry": {
+    "read_actions": "No routine retry. After a technical failure, allow at most one diagnostic recovery when no business effect occurred.",
+    "mutation_actions": "No automatic retry. Query state/idempotency only after an ambiguous result and resume only when duplication is impossible."
+  },
+  "exceptions": {
+    "unknown_page_state": "Return the failing observation; collect expanded DOM/state at most once and only if needed for diagnosis.",
+    "unknown_sap_error": "Return NEED_DECISION or FAILURE with the exact message already observed.",
+    "source_changed": "Recheck source hash only after an explicit change signal or resumed run; never mix versions.",
+    "external_system": "Run ASK_SKIP_OR_MANUAL. SKIP records SKIPPED and rechecks dependencies; MANUAL remains PENDING_EXTERNAL until explicit user completion confirmation is recorded as source=USER Evidence. Update the same progress workbook while pending."
+  }
+}

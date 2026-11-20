@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sap-ut-tester/test-contract.schema.json",
+  "title": "SAP Fiori STP Test Contract",
+  "type": "object",
+  "required": ["status", "contract_version", "run_id", "source", "identities", "scope", "authorization", "steps", "issues"],
+  "$defs": {
+    "cell_input": {
+      "type": "object",
+      "required": ["value", "display_value", "formula", "source_ref"],
+      "properties": {
+        "value": {},
+        "display_value": {},
+        "formula": {"type": ["string", "null"]},
+        "source_ref": {"type": "string", "minLength": 1}
+      }
+    }
+  },
+  "properties": {
+    "status": {"enum": ["SUCCESS", "NEED_DECISION", "BLOCKED"]},
+    "contract_version": {"const": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "source": {
+      "type": "object",
+      "required": ["path", "sha256", "source_kind"],
+      "properties": {
+        "path": {"type": "string"},
+        "sha256": {"type": ["string", "null"]},
+        "source_kind": {"enum": ["xlsx", "table", "file", "message", "verified_snapshot"]},
+        "sheet": {"type": ["string", "null"]},
+        "header_row": {"type": ["integer", "null"], "minimum": 1},
+        "snapshot_of": {"type": ["string", "null"]},
+        "snapshot_verified_by": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "identities": {
+      "type": "object",
+      "required": ["requested_case_id", "filename_ids", "sheet_ids", "row_case_ids"],
+      "properties": {
+        "requested_case_id": {"type": ["string", "null"]},
+        "filename_ids": {"type": "array", "items": {"type": "string"}},
+        "sheet_ids": {"type": "array", "items": {"type": "string"}},
+        "row_case_ids": {"type": "array", "items": {"type": "string"}},
+        "row_id_sources": {"type": "array", "items": {"$ref": "#/$defs/cell_input"}}
+      }
+    },
+    "scope": {
+      "type": "object",
+      "required": ["module_required", "surface_required"],
+      "properties": {
+        "module_required": {"const": "STP"},
+        "surface_required": {"const": "SAP_FIORI"},
+        "excluded_modules": {"type": "array", "items": {"type": "string"}},
+        "selection": {
+          "type": "object",
+          "required": ["mode", "source_ref", "selected_rows"],
+          "properties": {
+            "mode": {"enum": ["row", "workbook"]},
+            "source_ref": {"type": ["string", "null"]},
+            "selected_rows": {"type": "array", "items": {"type": "object", "required": ["sheet", "row"], "properties": {"sheet": {"type": "string"}, "row": {"type": "integer", "minimum": 1}}}}
+          },
+          "if": {"properties": {"mode": {"const": "workbook"}}},
+          "then": {"properties": {"source_ref": {"type": "string", "minLength": 1}}}
+        }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "properties": {
+        "host": {"type": ["string", "null"]},
+        "client": {"type": ["string", "null"]},
+        "classification": {"enum": ["DEV", "TEST", "QAS", "PRD", "UNCONFIRMED", null]},
+        "user": {"type": ["string", "null"]},
+        "evidence_ref": {"type": ["string", "null"]}
+      }
+    },
+    "authorization": {
+      "type": "object",
+      "required": ["effect_classes", "objects", "granted_by", "granted_at"],
+      "properties": {
+        "effect_classes": {"type": "array", "items": {"enum": ["READ", "DRAFT", "CREATE", "UPDATE", "SEND", "POST", "APPROVE", "DELETE"]}},
+        "objects": {"type": "array", "items": {"type": "string"}},
+        "granted_by": {"type": ["string", "null"]},
+        "granted_at": {"type": ["string", "null"]},
+        "expires_at": {"type": ["string", "null"]}
+      }
+    },
+    "test_data": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "raw_value", "source_ref", "authorized_for_run"],
+        "properties": {
+          "name": {"type": "string"},
+          "raw_value": {},
+          "formula": {"type": ["string", "null"]},
+          "display_value": {},
+          "canonical_value": {},
+          "data_type": {"type": ["string", "null"]},
+          "unit": {"type": ["string", "null"]},
+          "source_ref": {"type": "string"},
+          "source_kind": {"enum": ["source_test_data", "current_run_output", "user_supplied", "historical_output"]},
+          "authorized_for_run": {"type": "boolean"}
+        }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["step_key", "module_raw", "module_normalized", "case_id", "step_count", "app", "operations", "expected_result_raw", "expected_assertions", "depends_on", "history"],
+        "properties": {
+          "step_key": {
+            "type": "object",
+            "required": ["sheet", "row"],
+            "properties": {
+              "sheet": {"type": "string"},
+              "row": {"type": "integer", "minimum": 1},
+              "step_count": {},
+              "operation_no": {}
+            }
+          },
+          "module_raw": {},
+          "module_normalized": {"const": "STP"},
+          "case_id": {"type": ["string", "null"]},
+          "case_id_source": {"anyOf": [{"$ref": "#/$defs/cell_input"}, {"type": "null"}]},
+          "source_refs": {"type": "object", "additionalProperties": {"type": "string"}},
+          "step_count": {},
+          "description": {"type": ["string", "null"]},
+          "app": {
+            "type": "object",
+            "required": ["raw_name", "app_id", "route", "surface"],
+            "properties": {
+              "raw_name": {"type": ["string", "null"]},
+              "app_id": {"type": ["string", "null"]},
+              "route": {"type": ["string", "null"]},
+              "surface": {"enum": ["SAP_FIORI", "SAP_GUI", "UNKNOWN"]}
+            }
+          },
+          "operations": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["operation_no", "raw_text", "effect_class", "effect_triggers"],
+              "properties": {
+                "operation_no": {},
+                "raw_text": {"type": "string"},
+                "effect_class": {"enum": ["READ", "DRAFT", "CREATE", "UPDATE", "SEND", "POST", "APPROVE", "DELETE", "UNKNOWN"]},
+                "effect_triggers": {"type": "array", "items": {"type": "string"}}
+              }
+            }
+          },
+          "expected_assertions": {"type": "array"},
+          "expected_result_raw": {},
+          "external_systems": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+          "compiled_plan": {"type": ["object", "null"]},
+          "expected_state": {"type": ["string", "null"]},
+          "evidence_plan": {"type": "array"},
+          "depends_on": {"type": "array"},
+          "retry_policy": {"type": "object"},
+          "idempotency_policy": {"type": "object"},
+          "history": {"type": "object"}
+        }
+      }
+    },
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["code", "disposition", "message", "source_refs"],
+        "properties": {
+          "code": {"type": "string"},
+          "disposition": {"enum": ["INFO", "BLOCKED", "NEED_DECISION"]},
+          "message": {"type": "string"},
+          "source_refs": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

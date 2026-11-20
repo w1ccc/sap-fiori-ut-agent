@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "name": "verify-existing-object",
+  "purpose": "Verify one existing object through a compiled read-only route with no success-path Agent decision and no confirmatory reread.",
+  "inputs": [
+    "validated_test_contract",
+    "session_snapshot",
+    "compiled_readonly_plan"
+  ],
+  "preconditions": [
+    "The outer workflow validated exact STP scope and bound one authenticated Fiori session.",
+    "Every operation is READ and every input has current-run provenance.",
+    "The compiled plan contains one exact app target, search binding, read-only detail target, and explicit assertions."
+  ],
+  "states": [
+    "SESSION_VERIFIED",
+    "APP_READY",
+    "NEED_DECISION",
+    "BLOCKED",
+    "FAILED",
+    "EXECUTION_COMPLETE"
+  ],
+  "steps": [
+    {
+      "id": "open_app",
+      "kind": "action",
+      "action": "open_fiori_app",
+      "input_bindings": {
+        "compiled_app_profile": "{{compiled_readonly_plan.app}}",
+        "session_snapshot": "{{session_snapshot}}"
+      },
+      "expected_state": "APP_READY",
+      "on_result": {
+        "SUCCESS": "verify_record",
+        "NEED_DECISION": "NEED_DECISION",
+        "BLOCKED": "BLOCKED",
+        "FAILURE": "FAILED"
+      }
+    },
+    {
+      "id": "verify_record",
+      "kind": "action",
+      "action": "verify_exact_record",
+      "input_bindings": {
+        "compiled_readonly_plan": "{{compiled_readonly_plan}}",
+        "search_value": "{{compiled_readonly_plan.search_value}}",
+        "record_identity_fields": "{{compiled_readonly_plan.record_identity_fields}}",
+        "expected_assertions": "{{compiled_readonly_plan.expected_assertions}}",
+        "evidence_plan": "{{compiled_readonly_plan.evidence_plan}}"
+      },
+      "expected_state": "EXECUTION_COMPLETE",
+      "on_result": {
+        "SUCCESS": "EXECUTION_COMPLETE",
+        "NEED_DECISION": "NEED_DECISION",
+        "BLOCKED": "BLOCKED",
+        "FAILURE": "FAILED"
+      }
+    }
+  ],
+  "outputs": ["execution_status", "actual_values", "messages", "evidence_refs"],
+  "normal_path_budget": {
+    "agent_decisions": 0,
+    "browser_batches_if_app_reused": 1,
+    "browser_batches_if_app_opened": 2,
+    "diagnostic_reads": 0,
+    "screenshots_max": 2
+  },
+  "stop_conditions": {
+    "success": "The unique exact object's declared assertions are evaluated and required Evidence is saved.",
+    "failure": "The first zero/many candidate, unsafe route, identity conflict, SAP Error, missing element, timeout, or failed assertion is returned.",
+    "terminal_rule": "On EXECUTION_COMPLETE, FAILED, BLOCKED, or NEED_DECISION, return to the parent immediately without further browser reads."
+  },
+  "retry": {
+    "read_actions": "No routine retry. Allow one diagnostic recovery only after a technical failure proves no effect occurred.",
+    "mutation_actions": "Not applicable; this workflow cannot cross a mutation boundary."
+  },
+  "exceptions": {
+    "multiple_candidates": "Return NEED_DECISION with identities from the existing result observation.",
+    "unsafe_route": "Return BLOCKED without navigating.",
+    "unknown_message": "Escalate only when the message blocks progress or contradicts an assertion."
+  }
+}

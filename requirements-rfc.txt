@@ -1,0 +1,3 @@
+mcp>=2.2,<3
+python-dotenv>=1,<2
+# Install PyRFC separately for your OS and SAP NetWeaver RFC SDK version.

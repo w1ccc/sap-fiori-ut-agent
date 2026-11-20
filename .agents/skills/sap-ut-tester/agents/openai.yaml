@@ -1,0 +1,4 @@
+interface:
+  display_name: "SAP Fiori Test Agent"
+  short_description: "Run scoped Fiori tests with evidence and resumable reports"
+  default_prompt: "Use $sap-ut-tester to prepare the selected Fiori case, verify its execution scope, and report the observed results."

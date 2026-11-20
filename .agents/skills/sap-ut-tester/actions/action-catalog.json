@@ -1,0 +1,327 @@
+{
+  "schema_version": 1,
+  "execution_policy": {
+    "mode": "OPTIMISTIC",
+    "success_path": [
+      "Execute deterministic operations immediately; do not add confirmatory reads.",
+      "Use one semantic browser batch per page: locate once, fill all fields, perform the declared action, wait once, and reuse the terminal observation.",
+      "Consume the previous Action observation instead of rereading DOM, URL, title, route, messages, or values.",
+      "Return immediately when the Action stop_condition is met."
+    ],
+    "failure_only_triggers": [
+      "SAP returns Error or an actionable/contradictory Warning",
+      "A required element is missing or ambiguous",
+      "The declared next state is not reached",
+      "An operation times out",
+      "Save, Submit, Send, Post, Approve, Release, Order, or Delete has no terminal result",
+      "The observed state materially conflicts with the compiled plan"
+    ],
+    "hard_validations": [
+      "Exact STP scope and SAP Fiori surface",
+      "Required business inputs and current-run provenance",
+      "Match a verified non-production environment, client, object and authorized operation class immediately before each commit.",
+      "Unique exact business-object identity where selection is required",
+      "Terminal result of Save, Submit, Send, Post, Approve, Release, Order, or Delete",
+      "SAP Error, Expected-versus-Actual assertions, critical Evidence, and ambiguous mutation outcome"
+    ]
+  },
+  "result_statuses": [
+    "SUCCESS",
+    "FAILURE",
+    "BLOCKED",
+    "NEED_DECISION",
+    "PENDING_EXTERNAL",
+    "RECOVERED_SUCCESS",
+    "SKIPPED"
+  ],
+  "result_contract": {
+    "required": [
+      "status",
+      "state_before",
+      "state_after",
+      "data",
+      "messages",
+      "evidence_refs",
+      "attempt_id"
+    ],
+    "rules": [
+      "state_before and state_after are Workflow logical states derived from existing observations; never reread the page only to populate them.",
+      "messages and evidence_refs may be empty. Each message is an object with source, severity, and text. Preserve only messages already surfaced by the Action; use source SAP and severity ERROR only for an actual SAP Error, and preserve its text exactly.",
+      "The report writes only messages with source SAP and severity ERROR to the SAP error column. Success messages, generated identifiers, and workflow/environment blockers never enter that column.",
+      "Use an output identifier shown by the commit response or terminal state. Query object state and idempotency only when the mutation result is ambiguous.",
+      "Do not convert report generation success into SAP execution success.",
+      "Once stop_condition is met, return without a confirmation read, extra screenshot, or Agent call."
+    ]
+  },
+  "actions": [
+    {
+      "id": "build_test_contract",
+      "name": "Build Test Contract",
+      "purpose": "Read a structured source once, select authoritative STP rows, and emit a provenance-preserving contract plus conflicts.",
+      "effect_class": "READ",
+      "inputs": [
+        "source_path",
+        "requested_case_id",
+        "scope_mode",
+        "scope_source",
+        "optional_verified_snapshot_path",
+        "validated_test_contract",
+        "current_run_bindings"
+      ],
+      "preconditions": [
+        "A snapshot is used only when explicitly verified for the named source."
+      ],
+      "execution": [
+        "Reuse the batch execution_contract when supplied. Otherwise run python -X utf8 scripts/build_test_contract.py SOURCE --case-id ID --output RAW, passing the explicit scope selection if present. Run python -X utf8 scripts/compile_execution_input.py RAW [--bindings CURRENT_RUN_JSON] --output COMPILED. Retain RAW unchanged. Use COMPILED.effective_status for case routing and its execution_contract.steps for Action inputs; a READY case can contain a Step awaiting bindings or an external decision."
+      ],
+      "expected_state": "CONTRACT_READY or CONTRACT_NEEDS_DECISION",
+      "outputs": [
+        "test_contract",
+        "raw_status",
+        "effective_status",
+        "source_hash",
+        "selected_rows",
+        "issues",
+        "identity_resolutions"
+      ],
+      "failure_conditions": [
+        "No exact STP rows",
+        "Source locked without a verified snapshot",
+        "Multiple unresolved case identities",
+        "Missing required execution fields"
+      ],
+      "failure_only_validation": [
+        "Handle a locked source or parser/schema error after the direct parser attempt."
+      ],
+      "interaction_budget": {
+        "normal_browser_batches": 0,
+        "diagnostic_browser_batches_max": 0
+      },
+      "stop_condition": "Parser or validated batch Contract emits raw and effective status, source hash, selected rows, issues, and any separate identity resolution; return that result immediately."
+    },
+    {
+      "id": "inspect_fiori_session",
+      "name": "Inspect Fiori Session",
+      "purpose": "Bind the existing authenticated Fiori tab and classify its environment with one browser observation.",
+      "effect_class": "READ",
+      "inputs": [
+        "environment_contract",
+        "expected_surface"
+      ],
+      "preconditions": [
+        "Use an authenticated SAP Fiori browser session for the operator's selected target."
+      ],
+      "execution": [
+        "Read the authenticated Fiori marker and the session host/client. Compare them with the requested target and the deployment's explicit environment classification.",
+        "Return BLOCKED if sign-in is required, or NEED_DECISION if the session contradicts the declared environment.",
+        "Reuse the verified binding until a reconnect, target change or contradictory observation."
+      ],
+      "expected_state": "SESSION_VERIFIED",
+      "outputs": [
+        "tab_binding",
+        "environment",
+        "application_surface",
+        "session_snapshot"
+      ],
+      "failure_conditions": [
+        "No authenticated session",
+        "Fiori versus SAP GUI conflict",
+        "User statement conflicts with URL or client",
+        "Environment remains unconfirmed for a mutation"
+      ],
+      "failure_only_validation": [
+        "Read title, login UI, banner, or extra DOM only when URL plus the Fiori marker is missing or contradictory."
+      ],
+      "interaction_budget": {
+        "normal_browser_batches": 1,
+        "diagnostic_browser_batches_max": 1
+      },
+      "stop_condition": "The authenticated Fiori surface, environment and client are verified, or a blocker or conflict is observed."
+    },
+    {
+      "id": "open_fiori_app",
+      "name": "Open Fiori App",
+      "purpose": "Reuse an already observed matching app or open one pre-resolved Fiori target and wait for one actionable ready element.",
+      "effect_class": "READ",
+      "inputs": [
+        "compiled_app_profile",
+        "session_snapshot"
+      ],
+      "preconditions": [
+        "SESSION_VERIFIED",
+        "The compiled profile resolves to one Fiori target."
+      ],
+      "execution": [
+        "If session_snapshot already proves the app ready, return without a browser read.",
+        "Otherwise navigate to the compiled target and wait once for its declared actionable ready element."
+      ],
+      "expected_state": "APP_READY",
+      "outputs": [
+        "app_id",
+        "route",
+        "reused",
+        "ready_element",
+        "observed_state"
+      ],
+      "failure_conditions": [
+        "Zero or multiple app matches",
+        "Resolved target is SAP GUI",
+        "Ready element not reached within the bounded wait"
+      ],
+      "failure_only_validation": [
+        "Read URL, title, route, or full DOM only after ready-element timeout or clear wrong-page state."
+      ],
+      "interaction_budget": {
+        "normal_browser_batches": 1,
+        "normal_browser_batches_when_reused": 0,
+        "diagnostic_browser_batches_max": 1
+      },
+      "stop_condition": "The declared actionable ready element is observed, or the first target/timeout conflict is observed."
+    },
+    {
+      "id": "verify_exact_record",
+      "name": "Verify Exact Existing Record",
+      "purpose": "Search one exact key, open its registered read-only route, and evaluate declared assertions in one uninterrupted semantic browser batch.",
+      "effect_class": "READ",
+      "inputs": [
+        "compiled_readonly_plan",
+        "search_value",
+        "record_identity_fields",
+        "expected_assertions",
+        "evidence_plan"
+      ],
+      "preconditions": [
+        "APP_READY",
+        "The plan contains one scoped search field/control, one registered read-only target, detail identity fields, and explicit comparators.",
+        "Inputs have current-run provenance."
+      ],
+      "execution": [
+        "In one browser batch, fill the exact key, search, wait once, and extract candidate identities.",
+        "For one exact candidate, use the registered read-only locator, wait for one detail anchor, then read all declared identity/assertion fields once.",
+        "Apply deterministic comparators and save only terminal Evidence; return zero candidates as FAILURE and multiple/conflicting candidates as NEED_DECISION."
+      ],
+      "expected_state": "EXECUTION_COMPLETE",
+      "outputs": [
+        "candidate_count",
+        "record_identity",
+        "actual_values",
+        "assertion_results",
+        "messages",
+        "evidence_refs",
+        "observed_state"
+      ],
+      "failure_conditions": [
+        "Zero exact candidates",
+        "Multiple or conflicting candidates",
+        "Registered read-only route unavailable",
+        "Detail identity mismatch",
+        "Assertion failure",
+        "SAP Error"
+      ],
+      "failure_only_validation": [
+        "Inspect route, title, expanded DOM, or alternate locators only after a missing element, timeout, unsafe destination, or identity conflict."
+      ],
+      "interaction_budget": {
+        "normal_browser_batches": 1,
+        "diagnostic_browser_batches_max": 1
+      },
+      "stop_condition": "All assertions are evaluated with required Evidence, or the first zero/many/error/timeout/identity conflict is observed."
+    },
+    {
+      "id": "execute_authorized_fiori_step",
+      "name": "Execute Authorized Fiori Step",
+      "purpose": "Execute one compiled Fiori operation plan and evaluate its Expected Result from the same terminal observation.",
+      "effect_class": "VARIABLE",
+      "inputs": [
+        "decision_id",
+        "compiled_operation_plan",
+        "authorization_token",
+        "expected_assertions",
+        "evidence_plan",
+        "expected_state"
+      ],
+      "preconditions": [
+        "All business choices are already resolved in the compiled plan.",
+        "The exact effect class and target object are authorized.",
+        "At most one business commit is present."
+      ],
+      "execution": [
+        "Compare the cached authorization token locally immediately before a commit; do not call the Agent or reread the browser for this gate.",
+        "For each page, locate once and fill all declared fields continuously without per-field confirmation.",
+        "Perform the declared action, wait once for its terminal state/message/output, and evaluate Expected-versus-Actual from that same observation.",
+        "Do not retry an ambiguous mutation; return the first unexpected state."
+      ],
+      "expected_state": "DECLARED_STEP_STATE",
+      "outputs": [
+        "state_before",
+        "state_after",
+        "active_output_ref",
+        "assertion_results",
+        "messages",
+        "evidence_refs",
+        "observed_state"
+      ],
+      "failure_conditions": [
+        "Authorization mismatch",
+        "Unresolved candidate or field",
+        "SAP Error",
+        "Missing element",
+        "Expected transition not reached",
+        "Ambiguous mutation outcome",
+        "Assertion failure"
+      ],
+      "failure_only_validation": [
+        "Read expanded DOM/URL/title only after missing element, wrong transition, or timeout.",
+        "Query object state and idempotency only after an ambiguous commit result.",
+        "Escalate only actionable/contradictory warnings or unknown business choices."
+      ],
+      "interaction_budget": {
+        "normal_browser_batches": "one_per_page",
+        "diagnostic_browser_batches_max": 1
+      },
+      "stop_condition": "The declared terminal state/message/output and assertions are obtained, or the first Error, timeout, missing element, wrong state, or ambiguous commit outcome is observed."
+    },
+    {
+      "id": "render_test_report",
+      "name": "Render Test Report",
+      "purpose": "Initialize or update the one Excel report owned by the current Codex conversation without recomputing or upgrading any SAP verdict.",
+      "effect_class": "LOCAL_WRITE",
+      "inputs": [
+        "batch_manifest",
+        "run_manifest",
+        "report_template",
+        "update_mode"
+      ],
+      "preconditions": [
+        "The batch owns one .xlsx path under results/ and has an environment/client binding.",
+        "For an update, use the saved progress or terminal run manifest for the selected case.",
+        "Use existing evidence to report known outcomes and blockers."
+      ],
+      "execution": [
+        "Initialize the report with python scripts/render_test_report.py initialize MANIFEST. For updates use python scripts/render_test_report.py update MANIFEST --case-id ID --run-manifest RUN. Use the same report path during recovery."
+      ],
+      "expected_state": "REPORT_READY",
+      "outputs": [
+        "excel_path",
+        "report_status",
+        "verification"
+      ],
+      "failure_conditions": [
+        "Conversation and run manifests conflict",
+        "Requested Environment/Client differs from the conversation binding",
+        "Evidence required by a completed assertion/state is missing",
+        "Target workbook belongs to another conversation",
+        "Write or required structure check fails",
+        "Output path is outside results"
+      ],
+      "failure_only_validation": [
+        "Reopen, repair, or visually render a report only after the lightweight check fails."
+      ],
+      "interaction_budget": {
+        "normal_browser_batches": 0,
+        "diagnostic_browser_batches_max": 0
+      },
+      "stop_condition": "The current conversation's sole Excel is initialized or updated under results and passes the required structure check, or the first rendering/structure error is returned."
+    }
+  ]
+}

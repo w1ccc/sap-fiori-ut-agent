@@ -1,0 +1,312 @@
+{
+  "schema_version": 1,
+  "name": "execute-fiori-ut-batch",
+  "purpose": "Execute, continue, rerun, or resume STP Test Cases from one or more sources while maintaining exactly one Excel report for the current Codex conversation.",
+  "inputs": [
+    "user_request",
+    "conversation_id",
+    "report_started_at",
+    "requested_environment",
+    "test_requests",
+    "optional_verified_source_snapshots",
+    "existing_conversation_manifest",
+    "verified_recovery_checkpoint",
+    "external_intervention_decisions",
+    "authorization"
+  ],
+  "preconditions": [
+    "The user explicitly selected a non-empty set of Test Case IDs and each request identifies its own source. For resume, the existing_conversation_manifest and verified_recovery_checkpoint are supplied.",
+    "The current Codex conversation owns exactly one report path and one Environment/Client. Different Case Contracts may use different source files, but each Contract has one verified source version.",
+    "Only rows whose authoritative Module is exactly STP can execute."
+  ],
+  "states": [
+    "REQUEST_RECEIVED",
+    "BATCH_CONTRACTS_READY",
+    "BATCH_READY",
+    "RESUME_VALIDATED",
+    "REPORT_READY",
+    "SESSION_VERIFIED",
+    "CASE_RUNNING",
+    "CASE_BLOCKED",
+    "PENDING_EXTERNAL",
+    "REPORT_FAILED",
+    "PAUSED_FOR_INTERVENTION",
+    "BATCH_COMPLETE",
+    "NOT_SUPPORTED"
+  ],
+  "steps": [
+    {
+      "id": "select_batch_entry",
+      "kind": "rule",
+      "rule_ids": ["SELECT_NEW_CONTINUE_OR_RESUME_CONVERSATION", "SINGLE_CONVERSATION_ENVIRONMENT"],
+      "description": "Start NEW_CONVERSATION_REPORT only when the current conversation has no manifest. CONTINUE_CONVERSATION reuses its report path for new Cases or reruns. RESUME_EXECUTION uses its recovery checkpoint. If the requested Environment/Client differs from the conversation binding, return NOT_SUPPORTED with the message 'A different environment requires a new batch' and do not touch SAP or Excel.",
+      "expected_state": "REQUEST_RECEIVED",
+      "on_result": {
+        "NEW_CONVERSATION_REPORT": "build_case_contracts",
+        "CONTINUE_CONVERSATION": "build_case_contracts",
+        "RESUME_EXECUTION": "validate_resume_checkpoint",
+        "NOT_SUPPORTED": "NOT_SUPPORTED",
+        "NEED_DECISION": "PAUSED_FOR_INTERVENTION"
+      }
+    },
+    {
+      "id": "build_case_contracts",
+      "kind": "loop",
+      "for_each": "{{test_requests}}",
+      "action": "build_test_contract",
+      "input_bindings": {
+        "source_path": "{{current_request.source_path}}",
+        "requested_case_id": "{{current_request.case_id}}",
+        "scope_mode": "{{current_request.scope_mode or row}}",
+        "scope_source": "{{current_request.explicit_scope_decision_ref}}",
+        "current_run_bindings": "{{current_request.verified_step_bindings}}",
+        "optional_verified_snapshot_path": "{{optional_verified_source_snapshots[current_request.source_path]}}",
+        "validated_test_contract": null
+      },
+      "collect_results_as": "current_request_case_contracts",
+      "collect_terminal_results": ["SUCCESS", "NEED_DECISION", "BLOCKED", "FAILURE"],
+      "after_all": "assemble_batch_manifest",
+      "expected_state": "BATCH_CONTRACTS_READY",
+      "stop_condition": "Every requested Case has one contract result tied to its own source path/hash, or a conflict within that Case/source requires intervention."
+    },
+    {
+      "id": "assemble_batch_manifest",
+      "kind": "rule",
+      "rule_ids": ["EXPLICIT_REQUEST_SCOPE", "CONVERSATION_REPORT_SCOPE", "PER_CASE_SOURCE_VERSION", "RESOLVE_EXPECTED_MULTI_CASE_IDENTITY", "UPSERT_CASE_REPORT", "REQUEST_ORDER", "ASSEMBLE_CONVERSATION_MANIFEST"],
+      "description": "Preserve every raw Contract status and issue. For a new conversation, fix conversation_id, report_started_at, Environment/Client, and report_path a unique .xlsx path under results/. For an existing conversation, reuse them. Add a new normalized Case ID in request order; when that Case already exists, replace its case entry in place and designate its Overall row, worksheet, Evidence, and run manifest for overwrite. Different Cases may point to different sources. A Case-local Contract issue does not prevent later independent Cases.",
+      "resolution_rules": {
+        "preserve_raw": "Within the current Case entry, never rewrite the parser's status, identities, or issues; record any resolution separately. An explicit rerun replaces the whole prior Case entry only after the new Contract is ready.",
+        "compiler": "Store the output of scripts/compile_execution_input.py: parser_status, effective_issues, effective_status, resolutions and execution_contract. Preserve the source-selected sheet/row order exactly. Workbook scope is accepted only when explicitly selected on the parser CLI. Keep step-local blockers and external dependencies with their source row.",
+        "dependency_scope": "Store verified depends_on_cases and prerequisites_ready on each entry when known. Keep missing information unknown.",
+        "case_entry": "Store source path/hash, raw_contract, parser_status, resolved_issue_codes, effective_issues, effective_status, and execution_contract. On rerun, replace the existing normalized Case entry after the new Contract is ready; leave all other Case entries unchanged.",
+        "batch_scope": "Do not override compiler identity or scope decisions. Pause on inconsistent source versions, report ownership or environment conflicts.",
+        "case_local": "Other unresolved Contract issues keep that Case effective_status as BLOCKED or NEED_DECISION. Manifest assembly may still return SUCCESS; the child Workflow reports that Case as BLOCKED without SAP execution, updates Excel, and the batch continues to the next independent Case."
+      },
+      "expected_state": "BATCH_READY",
+      "on_result": {
+        "NEW_REPORT_READY": "initialize_report",
+        "EXISTING_REPORT_READY": "select_case_before_session",
+        "NEED_DECISION": "PAUSED_FOR_INTERVENTION",
+        "BLOCKED": "PAUSED_FOR_INTERVENTION",
+        "FAILURE": "PAUSED_FOR_INTERVENTION"
+      }
+    },
+    {
+      "id": "validate_resume_checkpoint",
+      "kind": "rule",
+      "rule_ids": ["VALIDATE_IMMUTABLE_BATCH_RESUME", "VERIFY_RECOVERY_POINT", "SKIP_COMPLETED_WORK"],
+      "description": "Select the checkpoint belonging to the requested incomplete Case, verify it against the original conversation, Case/source hash and report owner, and preserve recorded results. Populate missing Case statuses in older manifests from their verified same-run results; unresolved progress must not be treated as an unstarted Case. For a pending external Case with no user decision or manual confirmation, retain its progress and checkpoint on its entry before selecting other eligible requested Cases. With the required decision, resume that same Case from its verified checkpoint. Do not reinitialize the report.",
+      "required_checkpoint_fields": ["checkpoint_id", "batch_id", "source_sha256", "excel_path", "case_index", "case_id", "contract_run_id", "phase", "next_step_index", "last_completed_step_key", "active_output_refs", "mutation_effect_state"],
+      "legacy_pending_checkpoint": "A historical checkpoint may identify PENDING_EXTERNAL via execution_status/status, or an AFTER_STEP checkpoint via resume_state=EXTERNAL_DECISION_REQUIRED. Preserve the original. Resolve missing ownership/cursor fields only from a matching original manifest, source hash and contiguous completed sheet/row Evidence. If ownership, next Step or commit outcome cannot be verified, leave that Case paused; never start it as fresh.",
+      "phase_rules": {
+        "PENDING_EXTERNAL": "Keep the original verified checkpoint attached to this Case. WAITING_FOR_EXTERNAL selects other eligible Cases without rerunning this one. After the user's required decision is verified, RESUME_EXECUTION targets this Case only.",
+        "BEFORE_STEP": "Resume at next_step_index only when no business effect from that Step is claimed.",
+        "AFTER_STEP": "Preserve the completed Action result and resume after last_completed_step_key.",
+        "REPORT_UPDATE_PENDING": "Retry only the pending Excel UPDATE from the saved run_manifest. After success restore resume_after_report (or the original verified Case checkpoint for a legacy report failure) and original business stop scope before passing the child outcome to evaluate_case_boundary. If pending progress cannot be recovered, stay paused.",
+        "AMBIGUOUS_MUTATION": "Remain paused. PROVEN_APPLIED may advance as RECOVERED_SUCCESS; PROVEN_ABSENT may retry the same Step only with explicit retry authorization. UNKNOWN never resumes."
+      },
+      "expected_state": "RESUME_VALIDATED",
+      "on_result": {
+        "WAITING_FOR_EXTERNAL": "select_case_before_session",
+        "RESUME_EXECUTION": "bind_batch_session",
+        "RESUME_REPORT_UPDATE": "resume_report_update",
+        "NEED_DECISION": "PAUSED_FOR_INTERVENTION",
+        "BLOCKED": "PAUSED_FOR_INTERVENTION",
+        "FAILURE": "PAUSED_FOR_INTERVENTION"
+      }
+    },
+    {
+      "id": "resume_report_update",
+      "kind": "action",
+      "action": "render_test_report",
+      "input_bindings": {
+        "batch_manifest": "{{conversation_manifest}}",
+        "run_manifest": "{{verified_recovery_checkpoint.pending_run_manifest}}",
+        "report_template": "references/report-template.md",
+        "update_mode": "UPDATE"
+      },
+      "expected_state": "REPORT_READY",
+      "on_result": {
+        "SUCCESS": "evaluate_case_boundary",
+        "FAILURE": "REPORT_FAILED"
+      }
+    },
+    {
+      "id": "initialize_report",
+      "kind": "action",
+      "action": "render_test_report",
+      "input_bindings": {
+        "batch_manifest": "{{conversation_manifest}}",
+        "run_manifest": null,
+        "report_template": "references/report-template.md",
+        "update_mode": "INITIALIZE"
+      },
+      "expected_state": "REPORT_READY",
+      "on_result": {
+        "SUCCESS": "select_case_before_session",
+        "FAILURE": "REPORT_FAILED"
+      }
+    },
+    {
+      "id": "select_case_before_session",
+      "kind": "rule",
+      "rule_ids": ["SELECT_READY_CASE"],
+      "command": "python -X utf8 scripts/select_next_case.py <conversation manifest path> --case-id <requested ID> [--case-id <requested ID> ...]",
+      "description": "Pass only IDs selected for this request, in request order. NEXT_CASE selects the returned case_id for binding and execution. While any Case waits externally, only a Case with known depends_on_cases, satisfied dependencies and prerequisites_ready=true can run. Record those fields from the request/Contract or an explicit decision; missing dependency information is unknown.",
+      "expected_state": "BATCH_READY",
+      "on_result": {
+        "NEXT_CASE": "bind_batch_session",
+        "PENDING_EXTERNAL": "PENDING_EXTERNAL",
+        "ALL_CASES_COMPLETE": "BATCH_COMPLETE",
+        "REPORT_FAILURE": "REPORT_FAILED",
+        "INTERVENTION_REQUIRED": "PAUSED_FOR_INTERVENTION",
+        "FAILURE": "PAUSED_FOR_INTERVENTION"
+      }
+    },
+    {
+      "id": "bind_batch_session",
+      "kind": "action",
+      "action": "inspect_fiori_session",
+      "input_bindings": {
+        "environment_contract": "{{conversation_manifest.environment}}",
+        "expected_surface": "SAP_FIORI"
+      },
+      "expected_state": "SESSION_VERIFIED",
+      "on_result": {
+        "SUCCESS": "execute_case_loop",
+        "NEED_DECISION": "route_session_failure",
+        "BLOCKED": "route_session_failure",
+        "FAILURE": "route_session_failure"
+      }
+    },
+    {
+      "id": "route_session_failure",
+      "kind": "rule",
+      "rule_ids": ["PRESERVE_VERIFIED_RESUME_ON_SESSION_FAILURE"],
+      "command": "python -X utf8 scripts/route_session_failure.py <select_batch_entry result> <saved session result path> [--checkpoint <verified checkpoint path>]",
+      "description": "Save the failed inspect_fiori_session result as its own attempt Evidence. Run the command with the actual entry selected earlier; supply the original verified checkpoint only for RESUME_EXECUTION. On pause, keep the returned checkpoint, Case results, active output references and existing Excel in place. The session failure Evidence is the only new record. If the command fails, pause with the original checkpoint.",
+      "expected_state": "PAUSED_FOR_INTERVENTION",
+      "on_result": {
+        "PAUSED_FOR_INTERVENTION": "PAUSED_FOR_INTERVENTION",
+        "INITIAL_SESSION_BLOCKER": "finalize_batch_session_blocker",
+        "FAILURE": "PAUSED_FOR_INTERVENTION"
+      }
+    },
+    {
+      "id": "finalize_batch_session_blocker",
+      "kind": "rule",
+      "rule_ids": ["NORMALIZE_SESSION_BLOCKER_FOR_REPORT", "MARK_ALL_CASE_STEPS_NOT_EXECUTED", "EMIT_RECOVERY_CHECKPOINT"],
+      "description": "For a fresh execution with no completed Step in this run, create the current BLOCKED run manifest from the existing Contract and session observation. On an explicit rerun this replaces that Case's previous manifest. Keep every Step NOT EXECUTED, write the non-SAP session blocker to Output Data / Actual Result, leave the SAP error column empty unless a typed SAP ERROR was actually observed, set case_stop_scope to BATCH_INTERVENTION_REQUIRED, and emit a BEFORE_STEP recovery checkpoint.",
+      "expected_state": "CASE_BLOCKED",
+      "on_result": {
+        "READY": "report_batch_session_blocker",
+        "FAILURE": "REPORT_FAILED"
+      }
+    },
+    {
+      "id": "report_batch_session_blocker",
+      "kind": "action",
+      "action": "render_test_report",
+      "input_bindings": {
+        "batch_manifest": "{{conversation_manifest}}",
+        "run_manifest": "{{session_blocker_run_manifest}}",
+        "report_template": "references/report-template.md",
+        "update_mode": "UPDATE"
+      },
+      "expected_state": "REPORT_READY",
+      "on_result": {
+        "SUCCESS": "PAUSED_FOR_INTERVENTION",
+        "FAILURE": "REPORT_FAILED"
+      }
+    },
+    {
+      "id": "execute_case_loop",
+      "kind": "loop",
+      "for_each": "{{the one Case selected by select_case_before_session, evaluate_case_boundary, or validated RESUME_EXECUTION}}",
+      "workflow": "execute-fiori-ut",
+      "input_bindings": {
+        "user_request": "{{user_request}}",
+        "test_source": "{{current_case_entry.source.path}}",
+        "requested_case_id": "{{current_case_entry.execution_contract.identities.requested_case_id}}",
+        "validated_test_contract": "{{current_case_entry.execution_contract}}",
+        "conversation_manifest": "{{conversation_manifest}}",
+        "optional_verified_source_snapshot": "{{optional_verified_source_snapshots[current_case_entry.source.path]}}",
+        "verified_session_snapshot": "{{bind_batch_session.session_snapshot}}",
+        "verified_recovery_checkpoint": "{{verified_recovery_checkpoint when it belongs to current_case_entry.execution_contract}}",
+        "external_intervention_decisions": "{{external_intervention_decisions for current_case_entry}}",
+        "authorization": "{{authorization}}"
+      },
+      "collect_results_as": "case_results",
+      "after_each": "evaluate_case_boundary",
+      "expected_state": "CASE_RUNNING"
+    },
+    {
+      "id": "evaluate_case_boundary",
+      "kind": "rule",
+      "rule_ids": ["REPORT_UPDATED", "BATCH_CONTINUATION_SAFE", "SELECT_READY_CASE"],
+      "command": "python -X utf8 scripts/select_next_case.py <conversation manifest path> --case-id <requested ID> [--case-id <requested ID> ...] --result <child workflow output path>",
+      "description": "Pass the child output with its case_id (or current_run_manifest.case_id), execution_status, report_status, case_stop_scope and any verified_recovery_checkpoint. For a report-only recovery pass the original child output with its recovered report outcome and original business stop scope. Persist the update on that Case only after the child attempted its progress or terminal report update. NEXT_CASE selects the returned case_id; PENDING_EXTERNAL returns the IDs still waiting and their stored checkpoints. A report or batch-wide failure takes priority over continuing.",
+      "on_result": {
+        "PENDING_EXTERNAL": "PENDING_EXTERNAL",
+        "NEXT_CASE": "reuse_or_bind_selected_session",
+        "ALL_CASES_COMPLETE": "BATCH_COMPLETE",
+        "INTERVENTION_REQUIRED": "PAUSED_FOR_INTERVENTION",
+        "REPORT_FAILURE": "REPORT_FAILED",
+        "FAILURE": "PAUSED_FOR_INTERVENTION"
+      }
+    },
+    {
+      "id": "reuse_or_bind_selected_session",
+      "kind": "rule",
+      "rule_ids": ["REUSE_VERIFIED_BATCH_SESSION"],
+      "description": "Use this segment's verified session for the selected Case. After report-only recovery there is no current session snapshot; bind once before executing the next Case.",
+      "expected_state": "BATCH_READY",
+      "on_result": {
+        "REUSE_VERIFIED": "execute_case_loop",
+        "INSPECT_REQUIRED": "bind_batch_session"
+      }
+    }
+  ],
+  "outputs": [
+    "conversation_manifest",
+    "case_results",
+    "batch_status",
+    "excel_path",
+    "report_status",
+    "verified_session_snapshot",
+    "verified_recovery_checkpoint",
+    "resume_case_index",
+    "next_decision_request"
+  ],
+  "continuation_rules": {
+    "case_local": "After updating the conversation Excel, continue to the next independent Case in the current request after PASS, FAIL, or a blocker proven to affect only that Case.",
+    "pending_external": "Keep each waiting Case's verified checkpoint and evidence on its own entry. The child updates the conversation's progress Excel. Continue proven independent requested Cases; when none is ready, return pending_case_ids for human follow-up. Only verified decisions can resume a waiting Case.",
+    "batch_intervention": "Pause the current request for an unreliable environment/session, current Case source-version conflict, ambiguous mutation effect, or report write failure. Keep other conversation Cases unchanged.",
+    "resume": "After human adjustment and verification of the recovery point, supply the existing conversation manifest and checkpoint, reuse the same Excel, rebind the verified conversation session, resume the current Case after completed Steps, and then continue in request order. Do not repeat completed steps or blindly retry an ambiguous mutation.",
+    "explicit_rerun": "A deliberate rerun of an existing normalized Case ID stays in the same conversation batch and overwrites that Case's Overall row, worksheet, Evidence, and run manifest without retaining the old copy.",
+    "environment_change": "Return NOT_SUPPORTED with 'A different environment requires a new batch'; do not bind a new session, execute SAP, or modify the conversation Excel."
+  },
+  "normal_path_budget": {
+    "agent_decisions_after_contract": 0,
+    "browser_batches": "Bind one verified Fiori session per new or resumed batch segment; all Cases reuse that snapshot while valid. Each Case keeps the page budget declared by execute-fiori-ut.",
+    "diagnostic_reads": 0,
+    "report_writes": "One initialization for the conversation, then in-place updates on each reported terminal Case or new external wait."
+  },
+  "stop_conditions": {
+    "complete": "Every Case in the current request has a reported PASS, FAIL, or BLOCKED result in the conversation Excel; the same report remains available for later requests in this conversation.",
+    "paused": "A batch-wide risk pauses the request immediately. A human wait pauses the affected scope; return PENDING_EXTERNAL once no eligible requested Case remains. Keep the same Excel as a progress report until all pending work is resolved.",
+    "report_failure": "Enter REPORT_FAILED and pause when the conversation Excel cannot be initialized or updated without risking another conversation report."
+  },
+  "retry": {
+    "case_local": "Do not automatically rerun a completed or failed Case; continue to the next independent Case after its report update. An explicit rerun overwrites only that Case's report and Evidence state.",
+    "batch_resume": "Resume only with the existing conversation manifest, the same report path, human adjustment, and a verified recovery point.",
+    "mutation_actions": "Never blindly retry an ambiguous mutation."
+  },
+  "exceptions": {
+    "source_changed": "Pause the affected Case when its Contract mixes source versions. Different Cases may validly use different source paths/hashes.",
+    "environment_changed": "Return NOT_SUPPORTED and require a new conversation; never modify the existing conversation report.",
+    "environment_or_session_unreliable": "Pause for human intervention and keep unstarted Cases NOT STARTED.",
+    "ambiguous_mutation": "Pause before any further Case until the business effect and recovery point are verified.",
+    "report_failure": "Pause without rerunning SAP or changing Evidence."
+  }
+}

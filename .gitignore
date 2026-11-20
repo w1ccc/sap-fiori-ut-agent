@@ -1,0 +1,36 @@
+# Local connections and runtime data
+.env
+.env.*
+!.env.example
+SAP_SYSTEM_INFO
+*[Ll]ogin [Ii]nfo*.txt
+*.log
+*.trc
+*.pse
+*.pem
+*.key
+
+# Inputs, workbooks and evidence
+/results/
+/test-script/
+/test-cases/
+/inputs/
+/evidence/
+*.xlsx
+*.xls
+*.docx
+*.pdf
+*.png
+*.jpg
+*.zip
+/contract*.json
+/compiled*.json
+/conversation*.json
+/run-manifest*.json
+
+# Developer environment
+__pycache__/
+*.py[cod]
+.venv/
+.codex/
+.codex-tmp/
